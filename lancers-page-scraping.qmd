@@ -38,7 +38,7 @@ class LancersSpider(scrapy.Spider):
     name = 'lancers'
 
     # 設定を直接コード内に記述
-    start_urls = ['']
+    start_urls = ['https://www.lancers.jp/user/login']
     base_url = ''  #スクレイピングするページの最初のページ
     output_base_dir = 'scraping_data/'
 
