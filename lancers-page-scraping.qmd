@@ -1,0 +1,158 @@
+---
+title: "ランサーズの作業ページをスクレイピングする"
+date: 2024-10-21
+format:
+  html:
+    toc: true
+    number-sections: false
+code-fold: true
+---
+
+ライブラリのインストール
+
+```zsh
+pip install beautifulsoup4 requests scrapy
+```
+
+## ログインしてページをスクレイピングし, クリーニングして保存する
+
+このコードは、ページにログインしてスクレイピングを行い、取得したデータを `/raw` にHTML形式で保存します。また、データのクリーニングを行い、結果をCSV形式で `/processed` に保存する。具体的には、このコードはランサーズのプロジェクト作業状況ページのテーブルから情報を抽出し、実験参加者の承認状況やIDを取得して、CSVファイルとして保存する処理を行う。書き換えれば, 他の用途にも使用できるだろう。
+
+
+### 以下のコードを実行する
+
+IDE内のQuartoファイル内でPythonチャンクを実行するには, Jupyterの拡張機能をインストールする必要がある。また, コードチャンク内に読み込みたいページとログイン情報を書き込む。
+
+```{python}
+#| echo: false
+#| label: lancers-page-scraping
+import os
+import scrapy
+from scrapy.crawler import CrawlerProcess
+from scrapy.http import FormRequest
+from datetime import datetime
+import csv
+import re
+
+class LancersSpider(scrapy.Spider):
+    name = 'lancers'
+
+    # 設定を直接コード内に記述
+    start_urls = ['']
+    base_url = ''  #スクレイピングするページの最初のページ
+    output_base_dir = 'scraping_data/'
+
+    # ログイン情報
+    email = ''
+    password = ''
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # 全体の処理が始まったときにタイムスタンプを生成
+        self.current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.output_dir = os.path.join(self.output_base_dir, self.current_time)
+        self.input_dir = os.path.join(self.output_dir, 'raw')
+        self.processed_dir = os.path.join(self.output_dir, 'processed')
+        
+        # 出力ディレクトリが存在しない場合に作成
+        os.makedirs(self.input_dir, exist_ok=True)
+        os.makedirs(self.processed_dir, exist_ok=True)
+
+    def parse(self, response):
+        # CSRFトークンを取得
+        csrf_token = response.css('input[name="data[_Token][key]"]::attr(value)').get()
+        
+        # ログインフォームのデータを取得して送信
+        return FormRequest.from_response(
+            response,
+            formdata={
+                'data[User][email]': self.email,  # メールアドレスを入力
+                'data[User][password]': self.password,  # パスワードを入力
+                'data[_Token][key]': csrf_token  # CSRFトークンを追加
+            },
+            callback=self.after_login
+        )
+
+    def after_login(self, response):
+        # ログイン後のページを確認
+        if "ログインに失敗しました" in response.text:
+            self.logger.error("ログインに失敗しました")
+            return
+
+        # ログイン成功後、特定のページに移動
+        return scrapy.Request(
+            url=self.base_url,
+            callback=self.parse_page
+        )
+
+    def parse_page(self, response):
+        # ページ番号を取得（例: URLからページ番号を抽出）
+        page_number = self.extract_page_number(response.url)
+
+        # HTMLファイルを保存
+        html_file_name = os.path.join(self.input_dir, f"page_{page_number}.html")
+        with open(html_file_name, 'w', encoding='utf-8') as htmlfile:
+            htmlfile.write(response.text)
+
+        # データを抽出
+        data_list = []
+        for row in response.css('tr'):
+            # 各列のデータを取得
+            detail_link = row.css('a.c-link::attr(href)').get()
+            status = row.css('td:nth-child(3)::text').get()
+            task_number = row.css('td:nth-child(4)::text').get()
+            lancer_name = row.css('td:nth-child(5) a.c-link::text').get()
+            verification_status = row.css('td:nth-child(6) .c-tooltip__text::text').getall()
+            verification_status = ', '.join(verification_status)
+            response_count = row.css('td:nth-child(7)::text').get()
+
+            # データのクリーニング
+            data = {
+                'detail_link': self.clean_data(detail_link),
+                'status': self.clean_data(status),
+                'task_number': self.clean_data(task_number),
+                'lancer_name': self.clean_data(lancer_name),
+                'verification_status': self.clean_data(verification_status),
+                'response_count': self.clean_data(response_count)
+            }
+            data_list.append(data)
+
+        # データのクリーニングと保存を実行
+        self.process_and_save_data(data_list, page_number)
+
+        # 次のページへのリンクを探す
+        next_page = response.css('a[rel="next"]::attr(href)').get()
+
+        # 次のページが存在する場合に次のページを処理
+        if next_page:
+            yield response.follow(next_page, self.parse_page)
+
+    def clean_data(self, text):
+        if text:
+            text = text.replace('\n', ' ')  # 改行をスペースに置換
+            text = re.sub(r'\s+', ' ', text)  # 複数の空白を単一の空白に置換
+            text = text.strip()  # 前後の空白を削除
+        return text
+
+    def extract_page_number(self, url):
+        # URLからページ番号を抽出する正規表現
+        match = re.search(r'page:(\d+)', url)
+        if match:
+            return match.group(1)
+        return '1'  # デフォルトのページ番号
+
+    def process_and_save_data(self, data_list, page_number):
+        # CSVファイルにデータを保存
+        csv_file_name = os.path.join(self.processed_dir, f"page_{page_number}.csv")
+        with open(csv_file_name, 'w', newline='', encoding='utf-8') as csvfile:
+            fieldnames = ['detail_link', 'status', 'task_number', 'lancer_name', 'verification_status', 'response_count']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            for data in data_list:
+                writer.writerow(data)
+
+# Scrapyのプロセスを実行
+process = CrawlerProcess()
+process.crawl(LancersSpider)
+process.start()
+```
